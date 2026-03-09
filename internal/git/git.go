@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitreview/internal/state"
@@ -81,7 +82,20 @@ func (c Client) SubmodulePaths(dir string) ([]string, error) {
 }
 
 func (c Client) LoadCommits(dir, baseRef string) ([]state.Commit, error) {
-	out, err := c.run(dir, "log", baseRef+"..HEAD", "--date=short", "--pretty=format:%H%x09%h%x09%ad%x09%an%x09%s")
+	return c.loadLog(dir, []string{"log", "--date=short", "--pretty=format:%H%x09%h%x09%ad%x09%an%x09%s", baseRef + "..HEAD"})
+}
+
+func (c Client) LoadHistory(dir string, limit int) ([]state.Commit, error) {
+	args := []string{"log", "--date=short", "--pretty=format:%H%x09%h%x09%ad%x09%an%x09%s"}
+	if limit > 0 {
+		args = append(args, "-n", strconv.Itoa(limit))
+	}
+	args = append(args, "HEAD")
+	return c.loadLog(dir, args)
+}
+
+func (c Client) loadLog(dir string, args []string) ([]state.Commit, error) {
+	out, err := c.run(dir, args...)
 	if err != nil {
 		return nil, err
 	}

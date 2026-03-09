@@ -4,6 +4,7 @@
 
 It is built for branch review inside the terminal:
 - inspect commits ahead of `main`, `master`, or `origin/HEAD`
+- toggle into recent `HEAD` history for merged/older commit review
 - review a single commit diff
 - select a contiguous commit range
 - narrow a diff to a single file
@@ -22,6 +23,7 @@ Supported now:
 - commit filter mode with `/`
 - fullscreen diff and help overlay
 - auto-detected base branch, with `--base` override
+- toggleable capped history mode for large repos
 
 ## Requirements
 
@@ -85,6 +87,12 @@ gitreview --base main
 gitreview --base origin/main /path/to/repo
 ```
 
+History review mode:
+- press `h` to toggle between ahead-only review and recent `HEAD` history
+- the header shows the active scope and either `ahead: N` or `loaded: N`
+- history mode loads the most recent 300 commits first
+- press `]` to load 200 more history commits
+
 ## Submodules
 
 If you launch `gitreview` at a superproject root and initialized submodules are present, the left side will show a `REPOS` section above `COMMITS`.
@@ -103,16 +111,40 @@ Repos with `ahead > 0` are highlighted in green so related branch work is easier
 
 ## Keys
 
-- `j` / `k` or arrows: move
+Global:
 - `tab` / `shift+tab`: switch panels
 - `r`: open the repo/submodule switcher overlay
-- `enter`: focus diff or apply file filter
-- `space`: start or update a contiguous commit selection
-- `esc`: clear selection, file filter, or active filter mode
-- `/`: filter commits by subject or short SHA
+- `h`: toggle ahead-only review vs recent `HEAD` history
 - `f`: toggle fullscreen diff
 - `?`: open help
 - `q`: quit
+
+Repos panel:
+- `j` / `k` or arrows: move
+- `g` / `G`: jump to top / bottom
+- `enter` or `space`: switch repo or submodule
+
+Commits panel:
+- `j` / `k` or arrows: move
+- `PgUp` / `PgDn`: page
+- `g` / `G`: jump to top / bottom
+- `space`: start or update a contiguous commit selection
+- `enter`: focus diff
+- `/`: filter commits by subject or short SHA
+- `]`: load 200 more commits in history mode
+- `esc`: clear selection or exit active filter mode
+
+Files panel:
+- `j` / `k` or arrows: move
+- `PgUp` / `PgDn`: page
+- `g` / `G`: jump to top / bottom
+- `enter` or `space`: filter the diff to the selected file
+- `esc`: clear the active file filter
+
+Diff panel:
+- `j` / `k` or arrows: scroll
+- `PgUp` / `PgDn`: page scroll
+- `g` / `G`: jump to top / bottom
 
 ## Development
 

@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	ggit "gitreview/internal/git"
 	"gitreview/internal/repo"
@@ -205,5 +207,91 @@ func TestFilePagingUsesFilePanelRows(t *testing.T) {
 	got = updated.(Model)
 	if got.fileCursor != rows {
 		t.Fatalf("fileCursor = %d, want %d", got.fileCursor, rows)
+	}
+}
+
+func TestToggleHistoryScopeResetsReviewState(t *testing.T) {
+	commits := []state.Commit{
+		{SHA: "1", ShortSHA: "1111111", Subject: "alpha"},
+		{SHA: "2", ShortSHA: "2222222", Subject: "beta"},
+	}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseBranch: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+	got.cursor = 1
+	got.anchor = 0
+	got.filterMode = false
+	got.filterQuery = "beta"
+	got.filterActive = true
+	got.activeFile = "one.txt"
+	got.files = []string{"one.txt"}
+	got.diffLines = []string{"diff"}
+
+	updated, cmd := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	got = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected history load command")
+	}
+	if got.scope != commitScopeHistory {
+		t.Fatalf("scope = %q, want %q", got.scope, commitScopeHistory)
+	}
+	if got.cursor != 0 || got.anchor != -1 {
+		t.Fatalf("expected cursor reset and anchor cleared, got cursor=%d anchor=%d", got.cursor, got.anchor)
+	}
+	if got.filterMode || got.filterQuery != "" || got.filterActive || got.filterNoMatch {
+		t.Fatalf("expected filter state reset, got mode=%v query=%q active=%v noMatch=%v", got.filterMode, got.filterQuery, got.filterActive, got.filterNoMatch)
+	}
+	if got.activeFile != "" || len(got.files) != 0 || len(got.diffLines) != 0 {
+		t.Fatalf("expected panels reset, got activeFile=%q files=%v diff=%v", got.activeFile, got.files, got.diffLines)
+	}
+	if !got.loading {
+		t.Fatal("expected history mode to start loading")
+	}
+	if got.historyLimit != defaultHistoryLimit {
+		t.Fatalf("historyLimit = %d, want %d", got.historyLimit, defaultHistoryLimit)
+	}
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	got = updated.(Model)
+	if got.scope != commitScopeAhead {
+		t.Fatalf("scope = %q, want %q", got.scope, commitScopeAhead)
+	}
+	if len(got.commits) != len(commits) {
+		t.Fatalf("commits len = %d, want %d", len(got.commits), len(commits))
+	}
+}
+
+func TestLoadMoreHistoryIncreasesLimitOnlyInHistoryMode(t *testing.T) {
+	commits := []state.Commit{{SHA: "1", ShortSHA: "1111111", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseBranch: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	got = updated.(Model)
+	if got.historyLimit != defaultHistoryLimit {
+		t.Fatalf("historyLimit changed in ahead mode: %d", got.historyLimit)
+	}
+
+	got.scope = commitScopeHistory
+	updated, cmd := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
+	got = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected load-more command in history mode")
+	}
+	if got.historyLimit != defaultHistoryLimit+historyIncrement {
+		t.Fatalf("historyLimit = %d, want %d", got.historyLimit, defaultHistoryLimit+historyIncrement)
+	}
+}
+
+func TestTruncateRightPreservesStyledContentWidth(t *testing.T) {
+	styled := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("●")
+	input := "prefix " + styled + " long subject"
+	got := truncateRight(input, 18)
+	if lipgloss.Width(got) > 18 {
+		t.Fatalf("truncateRight width = %d, want <= 18", lipgloss.Width(got))
+	}
+	if !strings.Contains(got, "long") && !strings.Contains(got, "subject") {
+		t.Fatalf("truncateRight truncated too aggressively: %q", got)
 	}
 }

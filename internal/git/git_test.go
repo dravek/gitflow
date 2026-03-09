@@ -2,6 +2,7 @@ package git
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -236,5 +237,31 @@ func writeFile(t *testing.T, path, contents string) {
 
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	}
+}
+
+func TestLoadHistoryHonorsLimit(t *testing.T) {
+	root := initRepo(t, "main")
+	client, err := NewClient()
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		name := filepath.Join(root, fmt.Sprintf("%d.txt", i))
+		writeFile(t, name, fmt.Sprintf("%d\n", i))
+		gitCmd(t, root, "add", filepath.Base(name))
+		gitCmd(t, root, "commit", "-m", fmt.Sprintf("commit %d", i))
+	}
+
+	commits, err := client.LoadHistory(root, 2)
+	if err != nil {
+		t.Fatalf("LoadHistory() error = %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("LoadHistory() len = %d, want 2", len(commits))
+	}
+	if commits[0].Subject != "commit 3" || commits[1].Subject != "commit 2" {
+		t.Fatalf("LoadHistory() subjects = [%s %s], want [commit 3 commit 2]", commits[0].Subject, commits[1].Subject)
 	}
 }

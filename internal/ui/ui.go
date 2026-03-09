@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	ggit "gitreview/internal/git"
 	"gitreview/internal/repo"
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	minWidth      = 80
-	minHeight     = 24
-	debounceDelay = 150 * time.Millisecond
+	minWidth            = 80
+	minHeight           = 24
+	debounceDelay       = 150 * time.Millisecond
+	defaultHistoryLimit = 300
+	historyIncrement    = 200
 )
 
 type loadRequest struct {
@@ -40,6 +43,25 @@ type commitDetailsMsg struct {
 	err     error
 }
 
+type commitScope string
+
+const (
+	commitScopeAhead   commitScope = "ahead"
+	commitScopeHistory commitScope = "history"
+)
+
+type commitListRequest struct {
+	id    int
+	scope commitScope
+	limit int
+}
+
+type commitListMsg struct {
+	request commitListRequest
+	commits []state.Commit
+	err     error
+}
+
 type Model struct {
 	repos           []repo.Snapshot
 	activeRepoIndex int
@@ -47,10 +69,14 @@ type Model struct {
 	root            string
 	git             ggit.Client
 
-	allCommits []state.Commit
-	commits    []state.Commit
-	cursor     int
-	anchor     int
+	aheadCommits  []state.Commit
+	allCommits    []state.Commit
+	commits       []state.Commit
+	cursor        int
+	anchor        int
+	scope         commitScope
+	historyLimit  int
+	listRequestID int
 
 	filterMode    bool
 	filterQuery   string
@@ -85,12 +111,14 @@ type Model struct {
 
 func NewModel(repos []repo.Snapshot, gitClient ggit.Client) Model {
 	m := Model{
-		repos:      slices.Clone(repos),
-		git:        gitClient,
-		anchor:     -1,
-		focus:      state.FocusCommits,
-		viewMode:   state.ViewModeReview,
-		repoCursor: 0,
+		repos:        slices.Clone(repos),
+		git:          gitClient,
+		anchor:       -1,
+		focus:        state.FocusCommits,
+		viewMode:     state.ViewModeReview,
+		repoCursor:   0,
+		scope:        commitScopeAhead,
+		historyLimit: defaultHistoryLimit,
 	}
 	m.applyRepo(0)
 	return m
@@ -123,6 +151,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.err = nil
 		return m, m.loadRequest(msg.request)
+	case commitListMsg:
+		if msg.request.id != m.listRequestID || msg.request.scope != m.scope {
+			return m, nil
+		}
+
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.setCommitList(nil)
+			m.files = nil
+			m.diffLines = []string{msg.err.Error()}
+			return m, nil
+		}
+
+		m.err = nil
+		m.setCommitList(msg.commits)
+		if !m.hasActiveCommits() {
+			m.files = nil
+			m.diffLines = nil
+			return m, nil
+		}
+		return m.startImmediateLoad()
 	case commitDetailsMsg:
 		if msg.request.id != m.requestID {
 			return m, nil
@@ -172,6 +222,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "h":
+			return m.toggleCommitScope()
+		case "]":
+			return m.loadMoreHistory()
 		case "?":
 			m.helpVisible = true
 			return m, nil
@@ -478,11 +532,12 @@ func (m Model) applyFilterAndLoad() (tea.Model, tea.Cmd) {
 
 func (m Model) renderHeader() string {
 	return headerStyle.Render(fmt.Sprintf(
-		"repo: %s  branch: %s  base: %s  ahead: %d",
+		"repo: %s  branch: %s  base: %s  scope: %s  %s",
 		truncateRight(m.repoLabel(m.activeRepoIndex), 22),
 		truncateRight(m.info.CurrentBranch, 18),
 		truncateRight(m.info.BaseBranch, 18),
-		len(m.allCommits),
+		m.scope,
+		m.scopeSummary(),
 	))
 }
 
@@ -496,10 +551,11 @@ func (m Model) renderCommitsPanel(width int) string {
 	}
 
 	if len(m.allCommits) == 0 {
+		message := m.emptyCommitsMessage()
 		return panelStyleFor(m.focus == state.FocusCommits).
 			Width(width).
 			Height(m.commitsPanelHeight()).
-			Render(title + "\n\nNo commits ahead of " + m.info.BaseBranch + ".")
+			Render(title + "\n\n" + message)
 	}
 	if m.filterNoMatch {
 		return panelStyleFor(m.focus == state.FocusCommits).
@@ -650,7 +706,7 @@ func (m Model) renderStatus() string {
 	case state.FocusRepos:
 		return statusStyle.Render("[repos]    j/k move  enter switch  r overlay  tab next  ? help  q quit")
 	case state.FocusCommits:
-		return statusStyle.Render("[commits]  j/k move  space select  / filter  r repos  enter diff  tab next  f fullscreen  ? help  q quit")
+		return statusStyle.Render("[commits]  j/k move  space select  / filter  h scope  ] more  r repos  enter diff  tab next  f fullscreen  ? help  q quit")
 	case state.FocusFiles:
 		return statusStyle.Render("[files]  j/k move  enter filter  esc clear  r repos  tab next  ? help  q quit")
 	default:
@@ -665,6 +721,7 @@ func (m Model) renderHelp() string {
 		"Global",
 		"q            quit",
 		"f            toggle fullscreen diff",
+		"h            toggle ahead/history commit scope",
 		"?            open keyboard help",
 		"r            open repo/submodule switcher",
 		"",
@@ -683,6 +740,7 @@ func (m Model) renderHelp() string {
 		"space        set selection anchor",
 		"esc          clear selection",
 		"/            filter commits",
+		"]            load more history commits",
 		"enter        focus diff",
 		"",
 		"Files",
@@ -838,6 +896,104 @@ func (m Model) updateRepoPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) toggleCommitScope() (tea.Model, tea.Cmd) {
+	if m.scope == commitScopeAhead {
+		m.scope = commitScopeHistory
+		m.resetCommitViewState()
+		m.setCommitList(nil)
+		m.loading = true
+		request := m.nextCommitListRequest()
+		return m, m.loadCommitList(request)
+	}
+
+	m.scope = commitScopeAhead
+	m.resetCommitViewState()
+	m.setCommitList(m.aheadCommits)
+	if !m.hasActiveCommits() {
+		return m, nil
+	}
+	return m.scheduleDebouncedLoad()
+}
+
+func (m Model) loadMoreHistory() (tea.Model, tea.Cmd) {
+	if m.scope != commitScopeHistory {
+		return m, nil
+	}
+	activeSHA := m.activeCommitSHA()
+	m.historyLimit += historyIncrement
+	m.loading = true
+	m.err = nil
+	request := m.nextCommitListRequest()
+	cmd := m.loadCommitList(request)
+	if activeSHA != "" {
+		m.preFilterSHA = activeSHA
+	}
+	return m, cmd
+}
+
+func (m *Model) nextCommitListRequest() commitListRequest {
+	m.listRequestID++
+	return commitListRequest{
+		id:    m.listRequestID,
+		scope: m.scope,
+		limit: m.historyLimit,
+	}
+}
+
+func (m Model) loadCommitList(request commitListRequest) tea.Cmd {
+	root := m.root
+	gitClient := m.git
+
+	return func() tea.Msg {
+		commits, err := gitClient.LoadHistory(root, request.limit)
+		return commitListMsg{
+			request: request,
+			commits: commits,
+			err:     err,
+		}
+	}
+}
+
+func (m *Model) resetCommitViewState() {
+	m.cursor = 0
+	m.anchor = -1
+	m.filterMode = false
+	m.filterQuery = ""
+	m.preFilterSHA = ""
+	m.filterActive = false
+	m.filterNoMatch = false
+	m.files = nil
+	m.fileCursor = 0
+	m.activeFile = ""
+	m.diffLines = nil
+	m.diffScroll = 0
+	m.err = nil
+}
+
+func (m *Model) setCommitList(commits []state.Commit) {
+	m.allCommits = slices.Clone(commits)
+	m.commits = slices.Clone(commits)
+	m.cursor = min(m.cursor, max(len(m.commits)-1, 0))
+	m.authorDots = buildAuthorDots(commits)
+}
+
+func (m Model) scopeSummary() string {
+	if m.scope == commitScopeHistory {
+		return fmt.Sprintf("loaded: %d", len(m.allCommits))
+	}
+	return fmt.Sprintf("ahead: %d", len(m.aheadCommits))
+}
+
+func (m Model) emptyCommitsMessage() string {
+	if m.loading {
+		return "Loading commits..."
+	}
+	if m.scope == commitScopeHistory {
+		return "No commits loaded from HEAD history."
+	}
+	return "No commits ahead of " + m.info.BaseBranch + "."
+}
+
 func (m *Model) applyRepo(index int) {
 	if len(m.repos) == 0 {
 		return
@@ -851,23 +1007,12 @@ func (m *Model) applyRepo(index int) {
 	m.repoCursor = index
 	m.info = snapshot.Info
 	m.root = snapshot.Info.Root
-	m.allCommits = slices.Clone(snapshot.Commits)
-	m.commits = slices.Clone(snapshot.Commits)
-	m.cursor = 0
-	m.anchor = -1
-	m.filterMode = false
-	m.filterQuery = ""
-	m.preFilterSHA = ""
-	m.filterActive = false
-	m.filterNoMatch = false
-	m.files = nil
-	m.fileCursor = 0
-	m.activeFile = ""
-	m.diffLines = nil
-	m.diffScroll = 0
+	m.scope = commitScopeAhead
+	m.historyLimit = defaultHistoryLimit
+	m.aheadCommits = slices.Clone(snapshot.Commits)
+	m.resetCommitViewState()
+	m.setCommitList(snapshot.Commits)
 	m.loading = false
-	m.err = nil
-	m.authorDots = buildAuthorDots(snapshot.Commits)
 	if snapshot.LoadError != "" {
 		m.err = errors.New(snapshot.LoadError)
 	} else {
@@ -1077,11 +1222,7 @@ func truncateRight(value string, width int) string {
 	if width <= 1 || lipgloss.Width(value) <= width {
 		return value
 	}
-	runes := []rune(value)
-	if width >= len(runes) {
-		return value
-	}
-	return string(runes[:width-1]) + "…"
+	return ansi.Truncate(value, width, "…")
 }
 
 func truncateLeft(value string, width int) string {
