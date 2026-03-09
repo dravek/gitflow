@@ -156,17 +156,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		activeSHA := m.activeCommitSHA()
 		m.loading = false
 		if msg.err != nil {
 			m.err = msg.err
-			m.setCommitList(nil)
+			m.setCommitList(nil, "")
 			m.files = nil
 			m.diffLines = []string{msg.err.Error()}
 			return m, nil
 		}
 
 		m.err = nil
-		m.setCommitList(msg.commits)
+		m.setCommitList(msg.commits, activeSHA)
 		if !m.hasActiveCommits() {
 			m.files = nil
 			m.diffLines = nil
@@ -778,7 +779,7 @@ func (m Model) renderRepoPicker() string {
 		lines = append(lines, truncateRight(prefix+m.repoLabel(idx)+"  ["+snapshot.Info.CurrentBranch+"]  ahead:"+fmt.Sprintf("%d", len(snapshot.Commits))+current, max(20, m.width-8)))
 	}
 
-	lines = append(lines, "", "enter switch  esc close")
+	lines = append(lines, "", "enter/space switch  esc close")
 	return helpStyle.Width(m.width).Height(m.height).Render(strings.Join(lines, "\n"))
 }
 
@@ -887,7 +888,7 @@ func (m Model) updateRepoPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.repos) > 0 {
 			m.repoCursor = len(m.repos) - 1
 		}
-	case "enter":
+	case "enter", " ":
 		m.repoVisible = false
 		m.applyRepo(m.repoCursor)
 		return m.scheduleDebouncedLoad()
@@ -900,7 +901,7 @@ func (m Model) toggleCommitScope() (tea.Model, tea.Cmd) {
 	if m.scope == commitScopeAhead {
 		m.scope = commitScopeHistory
 		m.resetCommitViewState()
-		m.setCommitList(nil)
+		m.setCommitList(nil, "")
 		m.loading = true
 		request := m.nextCommitListRequest()
 		return m, m.loadCommitList(request)
@@ -908,7 +909,7 @@ func (m Model) toggleCommitScope() (tea.Model, tea.Cmd) {
 
 	m.scope = commitScopeAhead
 	m.resetCommitViewState()
-	m.setCommitList(m.aheadCommits)
+	m.setCommitList(m.aheadCommits, "")
 	if !m.hasActiveCommits() {
 		return m, nil
 	}
@@ -919,16 +920,11 @@ func (m Model) loadMoreHistory() (tea.Model, tea.Cmd) {
 	if m.scope != commitScopeHistory {
 		return m, nil
 	}
-	activeSHA := m.activeCommitSHA()
 	m.historyLimit += historyIncrement
 	m.loading = true
 	m.err = nil
 	request := m.nextCommitListRequest()
-	cmd := m.loadCommitList(request)
-	if activeSHA != "" {
-		m.preFilterSHA = activeSHA
-	}
-	return m, cmd
+	return m, m.loadCommitList(request)
 }
 
 func (m *Model) nextCommitListRequest() commitListRequest {
@@ -955,6 +951,7 @@ func (m Model) loadCommitList(request commitListRequest) tea.Cmd {
 }
 
 func (m *Model) resetCommitViewState() {
+	m.requestID++
 	m.cursor = 0
 	m.anchor = -1
 	m.filterMode = false
@@ -970,10 +967,14 @@ func (m *Model) resetCommitViewState() {
 	m.err = nil
 }
 
-func (m *Model) setCommitList(commits []state.Commit) {
+func (m *Model) setCommitList(commits []state.Commit, preserveSHA string) {
 	m.allCommits = slices.Clone(commits)
 	m.commits = slices.Clone(commits)
-	m.cursor = min(m.cursor, max(len(m.commits)-1, 0))
+	if preserveSHA != "" {
+		m.cursor = m.findCommitIndexBySHA(preserveSHA)
+	} else {
+		m.cursor = min(m.cursor, max(len(m.commits)-1, 0))
+	}
 	m.authorDots = buildAuthorDots(commits)
 }
 
@@ -1011,7 +1012,7 @@ func (m *Model) applyRepo(index int) {
 	m.historyLimit = defaultHistoryLimit
 	m.aheadCommits = slices.Clone(snapshot.Commits)
 	m.resetCommitViewState()
-	m.setCommitList(snapshot.Commits)
+	m.setCommitList(snapshot.Commits, "")
 	m.loading = false
 	if snapshot.LoadError != "" {
 		m.err = errors.New(snapshot.LoadError)

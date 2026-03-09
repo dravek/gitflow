@@ -274,6 +274,7 @@ func TestLoadMoreHistoryIncreasesLimitOnlyInHistoryMode(t *testing.T) {
 	}
 
 	got.scope = commitScopeHistory
+	got.listRequestID = 1
 	updated, cmd := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{']'}})
 	got = updated.(Model)
 	if cmd == nil {
@@ -293,5 +294,82 @@ func TestTruncateRightPreservesStyledContentWidth(t *testing.T) {
 	}
 	if !strings.Contains(got, "long") && !strings.Contains(got, "subject") {
 		t.Fatalf("truncateRight truncated too aggressively: %q", got)
+	}
+}
+
+func TestHistoryReloadPreservesActiveCommitBySHA(t *testing.T) {
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseBranch: "main"}, Commits: []state.Commit{{SHA: "a1", ShortSHA: "a1", Subject: "ahead"}}}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+	got.scope = commitScopeHistory
+	got.listRequestID = 1
+	got.setCommitList([]state.Commit{
+		{SHA: "c3", ShortSHA: "c3", Subject: "third"},
+		{SHA: "b2", ShortSHA: "b2", Subject: "second"},
+		{SHA: "a1", ShortSHA: "a1", Subject: "first"},
+	}, "")
+	got.cursor = 1
+
+	updated, _ = got.Update(commitListMsg{
+		request: commitListRequest{id: 1, scope: commitScopeHistory, limit: defaultHistoryLimit + historyIncrement},
+		commits: []state.Commit{
+			{SHA: "d4", ShortSHA: "d4", Subject: "fourth"},
+			{SHA: "c3", ShortSHA: "c3", Subject: "third"},
+			{SHA: "b2", ShortSHA: "b2", Subject: "second"},
+			{SHA: "a1", ShortSHA: "a1", Subject: "first"},
+		},
+	})
+	got = updated.(Model)
+	if got.cursor != 2 {
+		t.Fatalf("cursor = %d, want 2 to preserve SHA b2", got.cursor)
+	}
+	if got.commits[got.cursor].SHA != "b2" {
+		t.Fatalf("active SHA = %q, want b2", got.commits[got.cursor].SHA)
+	}
+}
+
+func TestToggleHistoryInvalidatesStaleDiffRequests(t *testing.T) {
+	commits := []state.Commit{{SHA: "1", ShortSHA: "1111111", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseBranch: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+	got.requestID = 7
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	got = updated.(Model)
+	if got.requestID != 8 {
+		t.Fatalf("requestID = %d, want 8", got.requestID)
+	}
+
+	updated, _ = got.Update(commitDetailsMsg{
+		request: loadRequest{id: 7, singleSHA: "1"},
+		files:   []string{"stale.txt"},
+		diff:    "stale diff",
+	})
+	got = updated.(Model)
+	if len(got.files) != 0 || len(got.diffLines) != 0 {
+		t.Fatalf("stale diff request should be ignored, got files=%v diff=%v", got.files, got.diffLines)
+	}
+}
+
+func TestRepoPickerSpaceSwitchesRepo(t *testing.T) {
+	repos := []repo.Snapshot{
+		{Info: repo.Info{Root: "/tmp/root", CurrentBranch: "main", BaseBranch: "main"}, Commits: []state.Commit{{SHA: "1", ShortSHA: "1", Subject: "root"}}},
+		{Info: repo.Info{Root: "/tmp/root/sub", CurrentBranch: "WP-1234", BaseBranch: "main"}, Commits: []state.Commit{{SHA: "2", ShortSHA: "2", Subject: "sub"}}},
+	}
+
+	model := NewModel(repos, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+	got.repoVisible = true
+	got.repoCursor = 1
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	got = updated.(Model)
+	if got.activeRepoIndex != 1 {
+		t.Fatalf("activeRepoIndex = %d, want 1", got.activeRepoIndex)
+	}
+	if got.repoVisible {
+		t.Fatal("expected repo picker to close after switching with space")
 	}
 }
