@@ -11,6 +11,12 @@ It is built for branch review inside the terminal:
 - switch between a root repo and initialized submodules
 - stay strictly read-only
 
+## Screenshots
+
+![Main UI with no submodules](docs/screenshots/screenshot1.jpg)
+
+![Git diff full screen](docs/screenshots/screenshot2.jpg)
+
 ## Current Status
 
 This repository contains a working v1 core implementation in Go.
