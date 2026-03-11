@@ -64,10 +64,11 @@ func (c Client) SubmodulePaths(dir string) ([]string, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) == 1 && lines[0] == "" {
+	if out == "" {
 		return nil, nil
 	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 
 	paths := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -100,10 +101,11 @@ func (c Client) loadLog(dir string, args []string) ([]state.Commit, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) == 1 && lines[0] == "" {
+	if out == "" {
 		return nil, nil
 	}
+
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 
 	commits := make([]state.Commit, 0, len(lines))
 	for _, line := range lines {

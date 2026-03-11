@@ -63,6 +63,24 @@ type commitListMsg struct {
 	err     error
 }
 
+type refreshRequest struct {
+	id    int
+	scope commitScope
+	limit int
+}
+
+type refreshMsg struct {
+	request        refreshRequest
+	currentBranch  string
+	aheadCommits   []state.Commit
+	historyCommits []state.Commit
+	err            error
+}
+
+type clearFlashMsg struct {
+	id int
+}
+
 type Model struct {
 	repos           []repo.Snapshot
 	activeRepoIndex int
@@ -78,6 +96,7 @@ type Model struct {
 	scope         commitScope
 	historyLimit  int
 	listRequestID int
+	refreshID     int
 
 	filterMode    bool
 	filterQuery   string
@@ -106,6 +125,8 @@ type Model struct {
 	loading   bool
 	err       error
 	requestID int
+	flashID   int
+	flashText string
 
 	authorDots map[string]lipgloss.Style
 }
@@ -189,6 +210,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.files = msg.files
+		activeFileMissing := false
+		if m.activeFile != "" {
+			idx := slices.Index(m.files, m.activeFile)
+			if idx == -1 {
+				m.activeFile = ""
+				activeFileMissing = true
+			} else {
+				m.fileCursor = idx
+			}
+		}
 		m.fileCursor = min(m.fileCursor, max(len(m.files)-1, 0))
 		m.diffLines = splitLines(msg.diff)
 		if len(m.diffLines) == 0 {
@@ -199,6 +230,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.diffScroll = 0
+		if activeFileMissing {
+			return m.startImmediateLoad()
+		}
+		return m, nil
+	case refreshMsg:
+		if msg.request.id != m.refreshID {
+			return m, nil
+		}
+
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.files = nil
+			m.diffLines = []string{msg.err.Error()}
+			return m, nil
+		}
+
+		activeSHA := m.activeCommitSHA()
+		m.err = nil
+		m.info.CurrentBranch = msg.currentBranch
+		m.aheadCommits = slices.Clone(msg.aheadCommits)
+		if m.activeRepoIndex >= 0 && m.activeRepoIndex < len(m.repos) {
+			m.repos[m.activeRepoIndex].Info.CurrentBranch = msg.currentBranch
+			m.repos[m.activeRepoIndex].Commits = slices.Clone(msg.aheadCommits)
+			m.repos[m.activeRepoIndex].LoadError = ""
+		}
+
+		if m.scope == commitScopeHistory {
+			m.setCommitList(msg.historyCommits, activeSHA)
+		} else {
+			m.setCommitList(msg.aheadCommits, activeSHA)
+		}
+		m.applyPersistedFilter(activeSHA)
+		m.flashText = "Refreshed"
+		flashCmd := m.scheduleFlashClear()
+		if m.anchor >= len(m.commits) {
+			m.anchor = -1
+		}
+		if !m.hasActiveCommits() {
+			m.files = nil
+			m.diffLines = nil
+			return m, flashCmd
+		}
+		updated, loadCmd := m.startImmediateLoad()
+		return updated, tea.Batch(loadCmd, flashCmd)
+	case clearFlashMsg:
+		if msg.id != m.flashID {
+			return m, nil
+		}
+		m.flashText = ""
 		return m, nil
 	case tea.KeyMsg:
 		if m.repoVisible {
@@ -224,6 +305,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "ctrl+r":
+			return m.startRefresh()
 		case "h":
 			return m.toggleCommitScope()
 		case "]":
@@ -719,15 +802,18 @@ func (m Model) statusText() string {
 	if m.err != nil {
 		return m.err.Error()
 	}
+	if m.flashText != "" {
+		return m.flashText
+	}
 	switch m.focus {
 	case state.FocusRepos:
-		return "[repos]    j/k move  enter switch  r overlay  tab next  ? help  q quit"
+		return "[repos]    j/k move  enter switch  ctrl+r refresh  r overlay  tab next  ? help  q quit"
 	case state.FocusCommits:
-		return "[commits]  j/k move  space select  / filter  h history  ] more  r repos  enter diff  tab next  f fullscreen  ? help  q quit"
+		return "[commits]  j/k move  space select  / filter  h history  ] more  ctrl+r refresh  r repos  enter diff  tab next  f fullscreen  ? help  q quit"
 	case state.FocusFiles:
-		return "[files]  j/k move  enter filter  esc clear  r repos  tab next  ? help  q quit"
+		return "[files]  j/k move  enter filter  esc clear  ctrl+r refresh  r repos  tab next  ? help  q quit"
 	default:
-		return "[diff]  j/k scroll  g/G top/bottom  PgUp/PgDn  r repos  tab next  f fullscreen  ? help  q quit"
+		return "[diff]  j/k scroll  g/G top/bottom  PgUp/PgDn  ctrl+r refresh  r repos  tab next  f fullscreen  ? help  q quit"
 	}
 }
 
@@ -737,6 +823,7 @@ func (m Model) renderHelp() string {
 		"",
 		"Global",
 		"q            quit",
+		"ctrl+r       refresh selected repo",
 		"f            toggle fullscreen diff",
 		"h            toggle ahead/history commit scope",
 		"?            open keyboard help",
@@ -966,8 +1053,61 @@ func (m Model) loadCommitList(request commitListRequest) tea.Cmd {
 	}
 }
 
+func (m Model) startRefresh() (tea.Model, tea.Cmd) {
+	if m.root == "" {
+		return m, nil
+	}
+	request := m.nextRefreshRequest()
+	m.loading = true
+	m.err = nil
+	return m, m.loadRefresh(request)
+}
+
+func (m *Model) nextRefreshRequest() refreshRequest {
+	m.refreshID++
+	return refreshRequest{
+		id:    m.refreshID,
+		scope: m.scope,
+		limit: m.historyLimit,
+	}
+}
+
+func (m Model) loadRefresh(request refreshRequest) tea.Cmd {
+	root := m.root
+	baseRef := m.info.BaseRef
+	gitClient := m.git
+
+	return func() tea.Msg {
+		currentBranch, err := gitClient.CurrentBranch(root)
+		if err != nil {
+			return refreshMsg{request: request, err: err}
+		}
+
+		aheadCommits, err := gitClient.LoadCommits(root, baseRef)
+		if err != nil {
+			return refreshMsg{request: request, err: err}
+		}
+
+		var historyCommits []state.Commit
+		if request.scope == commitScopeHistory {
+			historyCommits, err = gitClient.LoadHistory(root, request.limit)
+			if err != nil {
+				return refreshMsg{request: request, err: err}
+			}
+		}
+
+		return refreshMsg{
+			request:        request,
+			currentBranch:  currentBranch,
+			aheadCommits:   aheadCommits,
+			historyCommits: historyCommits,
+		}
+	}
+}
+
 func (m *Model) resetCommitViewState() {
 	m.requestID++
+	m.refreshID++
 	m.cursor = 0
 	m.anchor = -1
 	m.filterMode = false
@@ -989,9 +1129,41 @@ func (m *Model) setCommitList(commits []state.Commit, preserveSHA string) {
 	if preserveSHA != "" {
 		m.cursor = m.findCommitIndexBySHA(preserveSHA)
 	} else {
-		m.cursor = min(m.cursor, max(len(m.commits)-1, 0))
+		m.cursor = max(0, min(m.cursor, len(m.commits)-1))
 	}
 	m.authorDots = buildAuthorDots(commits)
+}
+
+func (m *Model) applyPersistedFilter(preserveSHA string) {
+	query := strings.ToLower(strings.TrimSpace(m.filterQuery))
+	if !m.filterActive || query == "" {
+		m.filterNoMatch = false
+		return
+	}
+
+	filtered := make([]state.Commit, 0, len(m.allCommits))
+	for _, commit := range m.allCommits {
+		if strings.Contains(strings.ToLower(commit.Subject), query) || strings.Contains(strings.ToLower(commit.ShortSHA), query) {
+			filtered = append(filtered, commit)
+		}
+	}
+
+	m.commits = filtered
+	m.filterNoMatch = len(filtered) == 0
+	m.anchor = -1
+	if len(filtered) == 0 {
+		m.cursor = 0
+		return
+	}
+	m.cursor = m.findCommitIndexBySHA(preserveSHA)
+}
+
+func (m *Model) scheduleFlashClear() tea.Cmd {
+	m.flashID++
+	id := m.flashID
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return clearFlashMsg{id: id}
+	})
 }
 
 func (m Model) scopeSummary() string {

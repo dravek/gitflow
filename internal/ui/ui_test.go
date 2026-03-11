@@ -387,3 +387,159 @@ func TestRepoPickerSpaceSwitchesRepo(t *testing.T) {
 		t.Fatal("expected repo picker to close after switching with space")
 	}
 }
+
+func TestCtrlRStartsRefresh(t *testing.T) {
+	commits := []state.Commit{{SHA: "a1", ShortSHA: "a1", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseRef: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	updated, cmd := got.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got = updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected refresh command")
+	}
+	if !got.loading {
+		t.Fatal("expected loading state after ctrl+r")
+	}
+	if got.refreshID == 0 {
+		t.Fatal("expected refresh request id to increment")
+	}
+}
+
+func TestRefreshPreservesCursorBySHA(t *testing.T) {
+	commits := []state.Commit{
+		{SHA: "a1", ShortSHA: "a1", Subject: "alpha"},
+		{SHA: "b2", ShortSHA: "b2", Subject: "beta"},
+	}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseRef: "main", CurrentBranch: "feature"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+	got.cursor = 1
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got = updated.(Model)
+
+	updated, _ = got.Update(refreshMsg{
+		request:       refreshRequest{id: got.refreshID, scope: commitScopeAhead, limit: defaultHistoryLimit},
+		currentBranch: "feature",
+		aheadCommits: []state.Commit{
+			{SHA: "c3", ShortSHA: "c3", Subject: "gamma"},
+			{SHA: "b2", ShortSHA: "b2", Subject: "beta"},
+			{SHA: "a1", ShortSHA: "a1", Subject: "alpha"},
+		},
+	})
+	got = updated.(Model)
+
+	if got.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 to preserve SHA b2", got.cursor)
+	}
+	if got.commits[got.cursor].SHA != "b2" {
+		t.Fatalf("active SHA = %q, want b2", got.commits[got.cursor].SHA)
+	}
+	if got.repos[got.activeRepoIndex].Info.CurrentBranch != "feature" {
+		t.Fatalf("repo current branch = %q, want feature", got.repos[got.activeRepoIndex].Info.CurrentBranch)
+	}
+	if len(got.repos[got.activeRepoIndex].Commits) != 3 {
+		t.Fatalf("repo ahead commits len = %d, want 3", len(got.repos[got.activeRepoIndex].Commits))
+	}
+}
+
+func TestRefreshIgnoresStaleResponse(t *testing.T) {
+	commits := []state.Commit{{SHA: "a1", ShortSHA: "a1", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseRef: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got = updated.(Model)
+	latest := got.refreshID
+
+	updated, _ = got.Update(refreshMsg{
+		request:       refreshRequest{id: latest - 1, scope: commitScopeAhead, limit: defaultHistoryLimit},
+		currentBranch: "changed",
+		aheadCommits:  []state.Commit{{SHA: "z9", ShortSHA: "z9", Subject: "stale"}},
+	})
+	got = updated.(Model)
+
+	if got.info.CurrentBranch == "changed" {
+		t.Fatal("stale refresh response should be ignored")
+	}
+	if got.commits[0].SHA != "a1" {
+		t.Fatalf("commits changed from stale refresh, got %q", got.commits[0].SHA)
+	}
+}
+
+func TestRefreshFromPreviousRepoIsIgnoredAfterSwitch(t *testing.T) {
+	repos := []repo.Snapshot{
+		{Info: repo.Info{Root: "/tmp/root", BaseRef: "main", CurrentBranch: "main"}, Commits: []state.Commit{{SHA: "r1", ShortSHA: "r1", Subject: "root"}}},
+		{Info: repo.Info{Root: "/tmp/root/sub", BaseRef: "main", CurrentBranch: "sub"}, Commits: []state.Commit{{SHA: "s1", ShortSHA: "s1", Subject: "sub"}}},
+	}
+	model := NewModel(repos, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got = updated.(Model)
+	staleID := got.refreshID
+
+	got.applyRepo(1)
+
+	updated, _ = got.Update(refreshMsg{
+		request:       refreshRequest{id: staleID, scope: commitScopeAhead, limit: defaultHistoryLimit},
+		currentBranch: "main",
+		aheadCommits:  []state.Commit{{SHA: "x9", ShortSHA: "x9", Subject: "stale"}},
+	})
+	got = updated.(Model)
+
+	if got.activeRepoIndex != 1 {
+		t.Fatalf("activeRepoIndex = %d, want 1", got.activeRepoIndex)
+	}
+	if got.info.CurrentBranch != "sub" {
+		t.Fatalf("current branch changed by stale refresh: %q", got.info.CurrentBranch)
+	}
+	if got.commits[0].SHA != "s1" {
+		t.Fatalf("active repo commits replaced by stale refresh, got %q", got.commits[0].SHA)
+	}
+}
+
+func TestHelpAndStatusMentionCtrlR(t *testing.T) {
+	commits := []state.Commit{{SHA: "a1", ShortSHA: "a1", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseRef: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	if !strings.Contains(got.statusText(), "ctrl+r refresh") {
+		t.Fatalf("status text missing refresh hint: %q", got.statusText())
+	}
+	if !strings.Contains(got.renderHelp(), "ctrl+r") {
+		t.Fatal("help text missing ctrl+r binding")
+	}
+}
+
+func TestRefreshShowsFlashAndClears(t *testing.T) {
+	commits := []state.Commit{{SHA: "a1", ShortSHA: "a1", Subject: "alpha"}}
+	model := NewModel([]repo.Snapshot{{Info: repo.Info{Root: "/tmp/root", BaseRef: "main"}, Commits: commits}}, ggit.Client{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	got := updated.(Model)
+
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	got = updated.(Model)
+
+	updated, _ = got.Update(refreshMsg{
+		request:       refreshRequest{id: got.refreshID, scope: commitScopeAhead, limit: defaultHistoryLimit},
+		currentBranch: "feature",
+		aheadCommits:  commits,
+	})
+	got = updated.(Model)
+
+	if got.statusText() != "Refreshed" {
+		t.Fatalf("status text = %q, want %q", got.statusText(), "Refreshed")
+	}
+
+	updated, _ = got.Update(clearFlashMsg{id: got.flashID})
+	got = updated.(Model)
+	if strings.Contains(got.statusText(), "Refreshed") {
+		t.Fatalf("status text should clear refresh flash, got %q", got.statusText())
+	}
+}
